@@ -1,6 +1,26 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Plus, AlertTriangle, CheckCircle, Clock, PlayCircle, X, UploadCloud, Inbox, Trash2, LayoutDashboard, History, Search, Lock, ArrowRight, LogOut } from 'lucide-react';
 
+// --- Firebase Imports (Realtime Database Version) ---
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getDatabase, ref, set, remove, onValue } from 'firebase/database';
+
+// --- Firebase Setup ---
+const firebaseConfig = {
+  apiKey: "AIzaSyDUWfFzAAHpS41uAFWkaFY2XhefuiUrGBE",
+  authDomain: "smt-production-status-ed62d.firebaseapp.com",
+  projectId: "smt-production-status-ed62d",
+  storageBucket: "smt-production-status-ed62d.firebasestorage.app",
+  messagingSenderId: "230954178046",
+  appId: "1:230954178046:web:7307979fea2a1691315caf",
+  measurementId: "G-RGMZT4SDJX"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getDatabase(app); // Initializing Realtime Database
+
 const DAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
 const CELLS = ['Cell 1', 'Cell 2', 'Cell 3', 'Cell 4', 'Cell 5A', 'Cell 5B'];
 
@@ -8,7 +28,7 @@ const CELLS = ['Cell 1', 'Cell 2', 'Cell 3', 'Cell 4', 'Cell 5A', 'Cell 5B'];
 const getMonday = () => {
   const d = new Date();
   const day = d.getDay();
-  const diff = d.getDate() - day + (day === 0 ? -6 : 1); // Adjust when day is Sunday
+  const diff = d.getDate() - day + (day === 0 ? -6 : 1); 
   const monday = new Date(d.setDate(diff));
   
   const yyyy = monday.getFullYear();
@@ -34,28 +54,15 @@ const calculateStatus = (wo, targetDay) => {
 };
 
 export default function App() {
-  // NOTE: The Tailwind injection useEffect was successfully removed from here for Vercel deployment!
-
   // --- Login States ---
   const [isAppLocked, setIsAppLocked] = useState(true);
   const [loginUser, setLoginUser] = useState('');
   const [loginPass, setLoginPass] = useState('');
   const [loginError, setLoginError] = useState('');
 
-  // --- Local Storage States ---
-  const [workOrders, setWorkOrders] = useState(() => {
-    const saved = localStorage.getItem('smt-work-orders');
-    if (!saved) return []; 
-    
-    const parsed = JSON.parse(saved);
-    // Automatically refresh statuses on load so past days shift to "Delayed" correctly
-    return parsed.map(wo => {
-      if (wo.status !== 'completed' && !wo.archived) {
-        return { ...wo, status: calculateStatus(wo, wo.day) };
-      }
-      return wo;
-    });
-  }); 
+  // --- Real-time States ---
+  const [user, setUser] = useState(null);
+  const [workOrders, setWorkOrders] = useState([]); 
   
   const [activeWeek, setActiveWeek] = useState(() => {
     const saved = localStorage.getItem('smt-active-week');
@@ -72,14 +79,68 @@ export default function App() {
   const fileInputRef = useRef(null);
   const mainContainerRef = useRef(null);
 
-  // --- Data Persistence Effect ---
+  // --- 1. Initialize Auth ---
   useEffect(() => {
-    localStorage.setItem('smt-work-orders', JSON.stringify(workOrders));
-  }, [workOrders]);
+    const initAuth = async () => {
+      try {
+        await signInAnonymously(auth);
+      } catch (err) {
+        console.error("Auth error:", err);
+      }
+    };
+    initAuth();
+    
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
 
+  // --- 2. Realtime Database Listener ---
   useEffect(() => {
-    localStorage.setItem('smt-active-week', activeWeek);
-  }, [activeWeek]);
+    if (!user) return;
+    
+    const ordersRef = ref(db, 'smt-work-orders');
+    const unsubscribe = onValue(ordersRef, (snapshot) => {
+      const data = snapshot.val();
+      
+      // Realtime Database returns an object, so we convert it to an array
+      const orders = data ? Object.values(data) : [];
+      
+      // Auto-refresh dynamic day statuses on load
+      const refreshedOrders = orders.map(wo => {
+        if (wo.status !== 'completed' && !wo.archived) {
+          const newStatus = calculateStatus(wo, wo.day);
+          if (newStatus !== wo.status) {
+            return { ...wo, status: newStatus };
+          }
+        }
+        return wo;
+      });
+
+      setWorkOrders(refreshedOrders);
+    }, (error) => {
+      console.error("RTDB sync error:", error);
+    });
+
+    return () => unsubscribe(); // Cleanup listener on unmount
+  }, [user]);
+
+  // --- 3. Synchronized Auto-Reset on New Monday Effect ---
+  useEffect(() => {
+    const currentMonday = getMonday();
+    
+    if (currentMonday !== activeWeek && workOrders.length > 0 && user) {
+      workOrders.forEach(async (wo) => {
+        if (!wo.archived) {
+          try {
+            await set(ref(db, `smt-work-orders/${wo.id}`), { ...wo, archived: true });
+          } catch(err) { console.error("Archive sync error", err); }
+        }
+      });
+      setActiveWeek(currentMonday);
+      localStorage.setItem('smt-active-week', currentMonday);
+      setSelectedWos([]);
+    }
+  }, [activeWeek, workOrders, user]);
 
   // --- Login & Logout Handlers ---
   const handleLogin = (e) => {
@@ -99,45 +160,10 @@ export default function App() {
     setActiveView('dashboard');
   };
 
-  // --- Synchronized Auto-Reset on New Monday Effect ---
-  useEffect(() => {
-    const checkWeekResetAndStatus = () => {
-      const currentMonday = getMonday();
-      if (currentMonday !== activeWeek) {
-        // A new week has started! Archive all current dashboard items
-        setWorkOrders(prev => prev.map(wo => ({ ...wo, archived: true })));
-        setActiveWeek(currentMonday);
-        setSelectedWos([]); // Clear any selections
-      } else {
-        // Same week, but let's re-evaluate daily statuses in case the day changed overnight
-        setWorkOrders(prev => {
-          let hasChanges = false;
-          const updated = prev.map(wo => {
-            if (wo.status !== 'completed' && !wo.archived) {
-              const newStatus = calculateStatus(wo, wo.day);
-              if (newStatus !== wo.status) {
-                hasChanges = true;
-                return { ...wo, status: newStatus };
-              }
-            }
-            return wo;
-          });
-          return hasChanges ? updated : prev;
-        });
-      }
-    };
-
-    checkWeekResetAndStatus(); // Check immediately on load
-    const interval = setInterval(checkWeekResetAndStatus, 3600000); // Check every 1 hour while open
-    return () => clearInterval(interval);
-  }, [activeWeek]);
-
   // --- Derived Data ---
-  // Dashboard only shows non-archived jobs
   const dashboardOrders = workOrders.filter(wo => !wo.archived);
   const unscheduledOrders = dashboardOrders.filter(wo => wo.cell === 'Unscheduled');
   
-  // History shows ALL completed jobs
   const completedOrders = workOrders.filter(wo => wo.status === 'completed');
   const filteredHistory = completedOrders
     .filter(wo => wo.modelName.toLowerCase().includes(historySearch.toLowerCase()) || wo.woNumber.toLowerCase().includes(historySearch.toLowerCase()))
@@ -187,37 +213,52 @@ export default function App() {
     setIsModalOpen(true);
   };
 
-  const handleSave = (e) => {
+  const handleSave = async (e) => {
     e.preventDefault();
-    setWorkOrders(prev => {
-      // Filter out the item currently being edited, AND any item matching the new WO + Model
-      const updatedList = prev.filter(wo => {
-        const isCurrentEdit = editingWo && wo.id === editingWo.id;
-        const isDuplicateWoModel = wo.woNumber === formData.woNumber && wo.modelName === formData.modelName && !wo.archived;
-        return !isCurrentEdit && !isDuplicateWoModel;
-      });
-      return [...updatedList, formData];
-    });
-    setIsModalOpen(false);
+    if (!user) return;
+    
+    try {
+      await set(ref(db, `smt-work-orders/${formData.id}`), formData);
+      setIsModalOpen(false);
+    } catch (err) {
+      console.error("Save error:", err);
+      alert("Failed to save work order. Check connection.");
+    }
   };
 
-  const handleDelete = () => {
-    if (editingWo) {
-      setWorkOrders(prev => prev.filter(wo => wo.id !== formData.id));
-      setIsModalOpen(false);
+  const handleDelete = async () => {
+    if (editingWo && user) {
+      try {
+        await remove(ref(db, `smt-work-orders/${formData.id}`));
+        setIsModalOpen(false);
+      } catch (err) {
+        console.error("Delete error:", err);
+      }
     }
   };
 
   const handleBulkDelete = () => {
-    if(window.confirm(`Are you sure you want to delete ${selectedWos.length} selected plan(s)?`)) {
-      setWorkOrders(prev => prev.filter(wo => !selectedWos.includes(wo.id)));
+    if(window.confirm(`Are you sure you want to delete ${selectedWos.length} selected plan(s)?`) && user) {
+      selectedWos.forEach(async (woId) => {
+        try {
+          await remove(ref(db, `smt-work-orders/${woId}`));
+        } catch (err) {
+          console.error("Bulk delete error:", err);
+        }
+      });
       setSelectedWos([]);
     }
   };
 
   const handleDeleteAllUnscheduled = () => {
-    if(window.confirm(`Are you sure you want to delete ALL ${unscheduledOrders.length} unscheduled plan(s)?`)) {
-      setWorkOrders(prev => prev.filter(wo => wo.cell !== 'Unscheduled' || wo.archived));
+    if(window.confirm(`Are you sure you want to delete ALL ${unscheduledOrders.length} unscheduled plan(s)?`) && user) {
+      unscheduledOrders.forEach(async (wo) => {
+        try {
+          await remove(ref(db, `smt-work-orders/${wo.id}`));
+        } catch (err) {
+          console.error("Delete all error:", err);
+        }
+      });
       setSelectedWos(prev => prev.filter(id => !unscheduledOrders.find(wo => wo.id === id)));
     }
   };
@@ -242,10 +283,10 @@ export default function App() {
 
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
-    if (!file) return;
+    if (!file || !user) return;
 
     const reader = new FileReader();
-    reader.onload = (event) => {
+    reader.onload = async (event) => {
       try {
         const text = event.target.result;
         
@@ -282,7 +323,6 @@ export default function App() {
         const colMap = { model: 2, wo: 6, plan: 10, planShip: 15 };
         let skippedRowsCount = 0;
         let importedCount = 0;
-        const newOrders = [];
 
         for (let i = 3; i < lines.length; i++) {
           const rawLine = lines[i];
@@ -323,7 +363,7 @@ export default function App() {
           newWo.status = calculateStatus(newWo, 'Unscheduled');
           if (newWo.status === 'completed') newWo.completedAt = new Date().toISOString();
           
-          newOrders.push(newWo);
+          await set(ref(db, `smt-work-orders/${newWo.id}`), newWo);
           importedCount++;
         }
 
@@ -332,8 +372,6 @@ export default function App() {
             e.target.value = null;
             return;
         }
-
-        setWorkOrders(prev => [...prev, ...newOrders]);
 
         let successMsg = `Successfully imported ${importedCount} production plans.`;
         if (skippedRowsCount > 0) {
@@ -383,25 +421,28 @@ export default function App() {
     }
   };
 
-  const handleDrop = (e, targetCell, targetDay) => {
+  const handleDrop = async (e, targetCell, targetDay) => {
     e.preventDefault();
     const woId = e.dataTransfer.getData('woId');
-    if (!woId) return;
+    if (!woId || !user) return;
 
-    setWorkOrders(prev => prev.map(wo => {
-      if (wo.id === woId) {
-        const updatedWo = { ...wo, cell: targetCell, day: targetDay };
-        const newStatus = calculateStatus(updatedWo, targetDay);
-        
-        if (newStatus === 'completed' && wo.status !== 'completed') {
-          updatedWo.completedAt = new Date().toISOString();
-        }
-        
-        updatedWo.status = newStatus;
-        return updatedWo;
+    const wo = workOrders.find(w => w.id === woId);
+    if (wo) {
+      const updatedWo = { ...wo, cell: targetCell, day: targetDay };
+      const newStatus = calculateStatus(updatedWo, targetDay);
+      
+      if (newStatus === 'completed' && wo.status !== 'completed') {
+        updatedWo.completedAt = new Date().toISOString();
       }
-      return wo;
-    }));
+      
+      updatedWo.status = newStatus;
+      
+      try {
+        await set(ref(db, `smt-work-orders/${woId}`), updatedWo);
+      } catch (err) {
+        console.error("Sync error on drop:", err);
+      }
+    }
   };
 
   const getStatusColor = (status) => {
@@ -511,12 +552,10 @@ export default function App() {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 font-sans relative z-0">
         
-        {/* Decorative Background Element (Replaces the empty void) */}
         <div className="absolute top-0 left-0 w-full h-96 bg-orange-600 transform -skew-y-2 origin-top-left -z-10 shadow-lg"></div>
 
         <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden flex flex-col border border-gray-100 z-10">
           
-          {/* Redesigned Clean White Header with Official Focuz Logo */}
           <div className="p-8 border-b border-gray-100 flex flex-col items-start bg-white">
             <svg viewBox="0 0 280 60" className="h-12 w-auto mb-4" xmlns="http://www.w3.org/2000/svg">
               <polygon points="0,60 15,0 35,0 20,60" fill="#e04616" />
@@ -617,7 +656,6 @@ export default function App() {
 
         <div className="flex items-center gap-2 sm:gap-4 text-xs sm:text-sm font-medium shrink-0 ml-auto">
              
-             {/* Logout Button */}
              <button 
                onClick={handleLogout}
                className="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 px-4 py-1.5 rounded-md transition-colors shadow-sm"
@@ -892,7 +930,7 @@ export default function App() {
         </main>
       )}
 
-      {/* Edit/Add Modal - FIXED SCROLLING */}
+      {/* Edit/Add Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 z-50 overflow-y-auto bg-slate-900/50 backdrop-blur-sm">
           <div className="flex min-h-screen items-center justify-center p-4">
