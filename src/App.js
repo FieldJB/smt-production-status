@@ -318,26 +318,42 @@ export default function App() {
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         
-        // Extract row metadata to detect hidden rows
-        const rowInfo = sheet['!rows'] || [];
-
-        // Convert the sheet to a 2D array, ensuring dates/numbers are parsed cleanly
-        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
-
-        if (rows.length === 0) {
+        if (!sheet || !sheet['!ref']) {
            alert("File seems to be empty. Please check the file.");
            e.target.value = null;
            return;
         }
 
         const visibleRows = [];
-        // 1. Strip out all hidden rows first
-        for (let i = 0; i < rows.length; i++) {
-           // rowInfo aligns 1:1 with the original rows array
-           if (rowInfo[i] && rowInfo[i].hidden) {
-               continue; // Ignore this row because it's hidden in Excel
+        const range = XLSX.utils.decode_range(sheet['!ref']);
+        const rowInfo = sheet['!rows'] || [];
+
+        // 1. Manually extract rows to guarantee correct alignment with hidden row metadata
+        for (let R = range.s.r; R <= range.e.r; ++R) {
+           // If the row is hidden in Excel (manual hide or filtered out), skip it!
+           if (rowInfo[R] && rowInfo[R].hidden) {
+               continue;
            }
-           visibleRows.push(rows[i]);
+
+           const rowData = [];
+           let isRowEmpty = true;
+           
+           // Loop through columns in this row
+           for (let C = range.s.c; C <= range.e.c; ++C) {
+               const cellRef = XLSX.utils.encode_cell({ c: C, r: R });
+               const cell = sheet[cellRef];
+               // Prefer the formatted text (cell.w), otherwise fallback to raw value (cell.v)
+               const cellValue = cell ? (cell.w !== undefined ? String(cell.w) : String(cell.v)) : "";
+               rowData.push(cellValue);
+               
+               if (cellValue.trim() !== '') {
+                   isRowEmpty = false;
+               }
+           }
+
+           if (!isRowEmpty) {
+               visibleRows.push(rowData);
+           }
         }
 
         let headerRowIndex = -1;
@@ -374,9 +390,6 @@ export default function App() {
         for (let i = headerRowIndex + 1; i < visibleRows.length; i++) {
           const cols = visibleRows[i];
           
-          // Skip if the row is entirely blank
-          if (cols.join('').trim() === '') continue;
-
           // Extract using the dynamically mapped column positions
           const model = colMap.model !== -1 ? String(cols[colMap.model] || '').trim() : '';
           const wo = colMap.wo !== -1 ? String(cols[colMap.wo] || '').trim() : '';
@@ -427,7 +440,7 @@ export default function App() {
 
         let successMsg = `Successfully imported ${importedCount} production plans.`;
         if (skippedRowsCount > 0) {
-            successMsg += `\n(Ignored ${skippedRowsCount} rows with 0 or missing quantities.)`;
+            successMsg += `\n(Ignored ${skippedRowsCount} hidden/empty rows with 0 or missing quantities.)`;
         }
         alert(successMsg);
         
