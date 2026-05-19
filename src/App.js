@@ -79,6 +79,16 @@ export default function App() {
   const fileInputRef = useRef(null);
   const mainContainerRef = useRef(null);
 
+  // --- Load Excel Library Dynamically ---
+  useEffect(() => {
+    if (!document.getElementById('xlsx-cdn')) {
+      const script = document.createElement('script');
+      script.id = 'xlsx-cdn';
+      script.src = 'https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js';
+      document.head.appendChild(script);
+    }
+  }, []);
+
   // --- 1. Initialize Auth ---
   useEffect(() => {
     const initAuth = async () => {
@@ -102,10 +112,8 @@ export default function App() {
     const unsubscribe = onValue(ordersRef, (snapshot) => {
       const data = snapshot.val();
       
-      // Realtime Database returns an object, so we convert it to an array
       const orders = data ? Object.values(data) : [];
       
-      // Auto-refresh dynamic day statuses on load
       const refreshedOrders = orders.map(wo => {
         if (wo.status !== 'completed' && !wo.archived) {
           const newStatus = calculateStatus(wo, wo.day);
@@ -121,7 +129,7 @@ export default function App() {
       console.error("RTDB sync error:", error);
     });
 
-    return () => unsubscribe(); // Cleanup listener on unmount
+    return () => unsubscribe();
   }, [user]);
 
   // --- 3. Synchronized Auto-Reset on New Monday Effect ---
@@ -265,9 +273,8 @@ export default function App() {
 
   const parseCustomDate = (dateStr) => {
     if (!dateStr) return null;
-    if (!isNaN(new Date(dateStr).getTime())) {
-      return new Date(dateStr).toISOString().split('T')[0];
-    }
+    
+    // Custom format parser (e.g. DD-MMM-YY)
     const parts = dateStr.split('-');
     if (parts.length === 3) {
       const day = parts[0].padStart(2, '0');
@@ -278,65 +285,75 @@ export default function App() {
       const month = months[monthStr];
       if (month) return `${year}-${month}-${day}`;
     }
+
+    // Standard format parser (e.g. M/D/YYYY)
+    const parsed = new Date(dateStr);
+    if (!isNaN(parsed.getTime())) {
+      const yyyy = parsed.getFullYear();
+      const mm = String(parsed.getMonth() + 1).padStart(2, '0');
+      const dd = String(parsed.getDate()).padStart(2, '0');
+      return `${yyyy}-${mm}-${dd}`;
+    }
+    
     return null;
   };
 
+  // --- Dynamic Excel & CSV Upload Logic ---
   const handleFileUpload = (e) => {
     const file = e.target.files[0];
     if (!file || !user) return;
 
+    const XLSX = window.XLSX;
+    if (!XLSX) {
+      alert("Excel parsing library is still loading. Please try again in a few seconds.");
+      e.target.value = null;
+      return;
+    }
+
     const reader = new FileReader();
     reader.onload = async (event) => {
       try {
-        const text = event.target.result;
+        const data = new Uint8Array(event.target.result);
+        const workbook = XLSX.read(data, { type: 'array' });
+        const sheetName = workbook.SheetNames[0];
+        const sheet = workbook.Sheets[sheetName];
         
-        const parseCSVLine = (line) => {
-          const result = [];
-          let currentCell = '';
-          let inQuotes = false;
-          for (let i = 0; i < line.length; i++) {
-            const char = line[i];
-            if (char === '"' && line[i+1] === '"') {
-                currentCell += '"';
-                i++;
-            } else if (char === '"') {
-                inQuotes = !inQuotes;
-            } else if (char === ',' && !inQuotes) {
-                result.push(currentCell.trim());
-                currentCell = '';
-            } else {
-                currentCell += char;
-            }
-          }
-          result.push(currentCell.trim());
-          return result;
-        };
+        // Extract row metadata to detect hidden rows
+        const rowInfo = sheet['!rows'] || [];
 
-        const lines = text.split(/\r\n|\n|\r/);
-        
-        if (lines.length === 0) {
-           alert("File seems to be empty. Please check the file format.");
+        // Convert the sheet to a 2D array, ensuring dates/numbers are parsed cleanly
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: false, defval: "" });
+
+        if (rows.length === 0) {
+           alert("File seems to be empty. Please check the file.");
            e.target.value = null;
            return;
+        }
+
+        const visibleRows = [];
+        // 1. Strip out all hidden rows first
+        for (let i = 0; i < rows.length; i++) {
+           // rowInfo aligns 1:1 with the original rows array
+           if (rowInfo[i] && rowInfo[i].hidden) {
+               continue; // Ignore this row because it's hidden in Excel
+           }
+           visibleRows.push(rows[i]);
         }
 
         let headerRowIndex = -1;
         let colMap = { model: -1, wo: -1, plan: -1, planShip: -1 };
 
-        // 1. Dynamically find the header row
-        for (let i = 0; i < lines.length; i++) {
-          const rawLine = lines[i];
-          if (!rawLine.trim()) continue;
+        // 2. Dynamically find the header row by searching for key columns
+        for (let i = 0; i < visibleRows.length; i++) {
+          const rawRow = visibleRows[i];
+          const cols = rawRow.map(c => String(c).toLowerCase().trim());
           
-          const cols = parseCSVLine(rawLine).map(c => c.toLowerCase().trim());
-          
-          // Look for matching column names (case-insensitive)
           const mIdx = cols.indexOf('model');
           const wIdx = cols.indexOf('wo');
           const pIdx = cols.indexOf('plan');
           const psIdx = cols.indexOf('plan ship');
           
-          // We require at least Model, WO, and Plan to consider it the valid header row
+          // Require at least Model, WO, and Plan to confirm it's the header row
           if (mIdx !== -1 && wIdx !== -1 && pIdx !== -1) {
             headerRowIndex = i;
             colMap = { model: mIdx, wo: wIdx, plan: pIdx, planShip: psIdx };
@@ -345,7 +362,7 @@ export default function App() {
         }
 
         if (headerRowIndex === -1) {
-          alert("Could not find the header row. Please ensure your CSV has columns named exactly 'Model', 'WO', and 'Plan'.");
+          alert("Could not find the headers. Please ensure your Excel file has columns named exactly 'Model', 'WO', and 'Plan'.");
           e.target.value = null;
           return;
         }
@@ -353,27 +370,25 @@ export default function App() {
         let skippedRowsCount = 0;
         let importedCount = 0;
 
-        // 2. Parse data rows starting immediately after the detected header row
-        for (let i = headerRowIndex + 1; i < lines.length; i++) {
-          const rawLine = lines[i];
+        // 3. Import the actual data
+        for (let i = headerRowIndex + 1; i < visibleRows.length; i++) {
+          const cols = visibleRows[i];
           
-          // Skip empty lines (often caused by trailing newlines or blank Excel rows)
-          if (!rawLine.trim() || rawLine.replace(/,/g, '').trim() === '') continue;
+          // Skip if the row is entirely blank
+          if (cols.join('').trim() === '') continue;
 
-          const cols = parseCSVLine(rawLine);
+          // Extract using the dynamically mapped column positions
+          const model = colMap.model !== -1 ? String(cols[colMap.model] || '').trim() : '';
+          const wo = colMap.wo !== -1 ? String(cols[colMap.wo] || '').trim() : '';
+          const planStr = colMap.plan !== -1 ? String(cols[colMap.plan] || '').trim() : '';
+          const planShip = colMap.planShip !== -1 ? String(cols[colMap.planShip] || '').trim() : '';
           
-          // Safely extract data using the dynamically mapped column indices
-          const model = colMap.model !== -1 ? (cols[colMap.model] || '').trim() : '';
-          const wo = colMap.wo !== -1 ? (cols[colMap.wo] || '').trim() : '';
-          const planStr = colMap.plan !== -1 ? (cols[colMap.plan] || '').trim() : '';
-          const planShip = colMap.planShip !== -1 ? (cols[colMap.planShip] || '').trim() : '';
-          
-          // Ignore rows missing critical identifiers
+          // Ignore rows missing critical data
           if (!model || !wo || !planStr) continue;
           
           const qtyPlanned = parseInt(planStr.replace(/,/g, ''), 10);
           
-          // Strict quantity validation (helps drop filtered/hidden/0-qty rows)
+          // Strict quantity validation (helps drop filtered/0-qty rows)
           if (isNaN(qtyPlanned) || qtyPlanned <= 0) {
               skippedRowsCount++;
               continue;
@@ -405,7 +420,7 @@ export default function App() {
         }
 
         if (importedCount === 0) {
-            alert("File read successfully, but no valid data rows were found.\nPlease ensure data starts at row 4 and quantities are > 0.");
+            alert("File read successfully, but no valid data rows were found.");
             e.target.value = null;
             return;
         }
@@ -417,8 +432,8 @@ export default function App() {
         alert(successMsg);
         
       } catch (error) {
-        console.error("Error parsing CSV:", error);
-        alert("An error occurred while reading the file.");
+        console.error("Error parsing Excel:", error);
+        alert("An error occurred while reading the file. Ensure it is a valid Excel or CSV format.");
       } finally {
          e.target.value = null;
       }
@@ -427,7 +442,8 @@ export default function App() {
       alert("Failed to read the file. Please try again.");
       e.target.value = null;
     };
-    reader.readAsText(file);
+    // Use readAsArrayBuffer for XLSX parsing
+    reader.readAsArrayBuffer(file);
   };
 
   const handleDragStart = (e, woId) => {
@@ -656,7 +672,7 @@ export default function App() {
       
       <input 
         type="file" 
-        accept=".csv" 
+        accept=".xlsx, .xls, .csv" 
         ref={fileInputRef} 
         onChange={handleFileUpload} 
         className="hidden" 
@@ -830,7 +846,7 @@ export default function App() {
                      onClick={() => fileInputRef.current.click()}
                      className="flex items-center gap-1.5 text-xs bg-slate-800 hover:bg-slate-700 text-white px-3 py-1.5 rounded-md border border-slate-700 transition-colors shadow-sm font-semibold"
                    >
-                     <UploadCloud className="w-3.5 h-3.5" /> Import CSV
+                     <UploadCloud className="w-3.5 h-3.5" /> Import Excel/CSV
                    </button>
                 )}
 
@@ -875,7 +891,7 @@ export default function App() {
               ) : (
                 <div className="m-auto text-slate-400 text-sm italic flex flex-col items-center">
                   <span>Tray is empty.</span>
-                  {userRole !== 'VMI' && <span>Upload a CSV file or drag blocks back here to unschedule them.</span>}
+                  {userRole !== 'VMI' && <span>Upload an Excel/CSV file or drag blocks back here to unschedule them.</span>}
                 </div>
               )}
             </div>
