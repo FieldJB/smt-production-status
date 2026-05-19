@@ -314,29 +314,66 @@ export default function App() {
 
         const lines = text.split(/\r\n|\n|\r/);
         
-        if (lines.length < 4) {
-           alert("File seems to be empty or missing data rows. Please check the file format.");
+        if (lines.length === 0) {
+           alert("File seems to be empty. Please check the file format.");
            e.target.value = null;
            return;
         }
 
-        const colMap = { model: 2, wo: 6, plan: 10, planShip: 15 };
+        let headerRowIndex = -1;
+        let colMap = { model: -1, wo: -1, plan: -1, planShip: -1 };
+
+        // 1. Dynamically find the header row
+        for (let i = 0; i < lines.length; i++) {
+          const rawLine = lines[i];
+          if (!rawLine.trim()) continue;
+          
+          const cols = parseCSVLine(rawLine).map(c => c.toLowerCase().trim());
+          
+          // Look for matching column names (case-insensitive)
+          const mIdx = cols.indexOf('model');
+          const wIdx = cols.indexOf('wo');
+          const pIdx = cols.indexOf('plan');
+          const psIdx = cols.indexOf('plan ship');
+          
+          // We require at least Model, WO, and Plan to consider it the valid header row
+          if (mIdx !== -1 && wIdx !== -1 && pIdx !== -1) {
+            headerRowIndex = i;
+            colMap = { model: mIdx, wo: wIdx, plan: pIdx, planShip: psIdx };
+            break;
+          }
+        }
+
+        if (headerRowIndex === -1) {
+          alert("Could not find the header row. Please ensure your CSV has columns named exactly 'Model', 'WO', and 'Plan'.");
+          e.target.value = null;
+          return;
+        }
+
         let skippedRowsCount = 0;
         let importedCount = 0;
 
-        for (let i = 3; i < lines.length; i++) {
+        // 2. Parse data rows starting immediately after the detected header row
+        for (let i = headerRowIndex + 1; i < lines.length; i++) {
           const rawLine = lines[i];
+          
+          // Skip empty lines (often caused by trailing newlines or blank Excel rows)
           if (!rawLine.trim() || rawLine.replace(/,/g, '').trim() === '') continue;
 
           const cols = parseCSVLine(rawLine);
-          const model = cols[colMap.model] || '';
-          const wo = cols[colMap.wo] || '';
-          const planStr = cols[colMap.plan] || '';
-          const planShip = cols[colMap.planShip] || '';
           
+          // Safely extract data using the dynamically mapped column indices
+          const model = colMap.model !== -1 ? (cols[colMap.model] || '').trim() : '';
+          const wo = colMap.wo !== -1 ? (cols[colMap.wo] || '').trim() : '';
+          const planStr = colMap.plan !== -1 ? (cols[colMap.plan] || '').trim() : '';
+          const planShip = colMap.planShip !== -1 ? (cols[colMap.planShip] || '').trim() : '';
+          
+          // Ignore rows missing critical identifiers
           if (!model || !wo || !planStr) continue;
           
           const qtyPlanned = parseInt(planStr.replace(/,/g, ''), 10);
+          
+          // Strict quantity validation (helps drop filtered/hidden/0-qty rows)
           if (isNaN(qtyPlanned) || qtyPlanned <= 0) {
               skippedRowsCount++;
               continue;
