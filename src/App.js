@@ -314,7 +314,8 @@ export default function App() {
     reader.onload = async (event) => {
       try {
         const data = new Uint8Array(event.target.result);
-        const workbook = XLSX.read(data, { type: 'array' });
+        // Added cellStyles: true to ensure we extract deep formatting like filtered heights
+        const workbook = XLSX.read(data, { type: 'array', cellStyles: true });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
         
@@ -330,8 +331,11 @@ export default function App() {
 
         // 1. Manually extract rows to guarantee correct alignment with hidden row metadata
         for (let R = range.s.r; R <= range.e.r; ++R) {
-           // If the row is hidden in Excel (manual hide or filtered out), skip it!
-           if (rowInfo[R] && rowInfo[R].hidden) {
+           const rowObj = rowInfo[R];
+           
+           // If the row is hidden in Excel (manual hide or AutoFilter), skip it!
+           // AutoFilters often crush row height to 0 (hpt/hpx = 0) instead of using the 'hidden' flag
+           if (rowObj && (rowObj.hidden === true || String(rowObj.hidden) === 'true' || rowObj.hpt === 0 || rowObj.hpx === 0)) {
                continue;
            }
 
@@ -365,9 +369,10 @@ export default function App() {
           const cols = rawRow.map(c => String(c).toLowerCase().trim());
           
           const mIdx = cols.indexOf('model');
-          const wIdx = cols.indexOf('wo');
-          const pIdx = cols.indexOf('plan');
-          const psIdx = cols.indexOf('plan ship');
+          // Slightly expanded safety net just in case columns have tiny variations
+          const wIdx = cols.findIndex(c => c === 'wo' || c === 'work order');
+          const pIdx = cols.findIndex(c => c === 'plan' || c === 'plan qty' || c === 'planned qty');
+          const psIdx = cols.findIndex(c => c === 'plan ship' || c === 'target date');
           
           // Require at least Model, WO, and Plan to confirm it's the header row
           if (mIdx !== -1 && wIdx !== -1 && pIdx !== -1) {
@@ -401,7 +406,7 @@ export default function App() {
           
           const qtyPlanned = parseInt(planStr.replace(/,/g, ''), 10);
           
-          // Strict quantity validation (helps drop filtered/0-qty rows)
+          // Strict quantity validation (helps drop remaining garbage rows)
           if (isNaN(qtyPlanned) || qtyPlanned <= 0) {
               skippedRowsCount++;
               continue;
